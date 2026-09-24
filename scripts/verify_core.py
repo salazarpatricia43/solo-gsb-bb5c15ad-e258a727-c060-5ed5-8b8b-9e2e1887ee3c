@@ -485,6 +485,49 @@ def main() -> int:
     assert replay["id"] == job["id"] and replay["depends_on"] == []
     print("case 12 dependency revision OK")
 
+    # --- Case 13: maintenance-slot queries ---------------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    j = submit("a", 2, 60, 1.0, iso(0))
+    scheduler.create_maintenance_window(at(100), at(200), 7)
+    r = scheduler.job_maintenance_slots(j["id"], at(0), at(300))
+    # 7 of 8 GPUs reserved over [100,200): starts in (40, 200) are blocked;
+    # the run [40,100) merely touches the window and stays feasible.
+    assert r["slots"] == [
+        {"start_at": iso(0), "end_at": iso(40),
+         "start_inclusive": True, "end_inclusive": True},
+        {"start_at": iso(200), "end_at": iso(300),
+         "start_inclusive": True, "end_inclusive": False},
+    ], r["slots"]
+    assert r["earliest_start_at"] == iso(0)
+    assert r["running_baseline_gpus"] == 0
+
+    # A second 7-GPU window exactly one duration later leaves a single
+    # isolated feasible instant (t=200) between the two blocked regions.
+    scheduler.create_maintenance_window(at(260), at(320), 7)
+    r = scheduler.job_maintenance_slots(j["id"], at(0), at(300))
+    assert r["slots"] == [
+        {"start_at": iso(0), "end_at": iso(40),
+         "start_inclusive": True, "end_inclusive": True},
+        {"start_at": iso(200), "end_at": iso(200),
+         "start_inclusive": True, "end_inclusive": True},
+    ], r["slots"]
+
+    # Only QUEUED jobs have slots; the RUNNING baseline is fixed (no future
+    # release is speculated) and shrinks the headroom for everyone else.
+    assert scheduler.run_batch(now=at(0))["selection_order"] == ["J000001"]
+    try:
+        scheduler.job_maintenance_slots(j["id"], at(0), at(300))
+    except scheduler.Conflict:
+        pass
+    else:
+        raise AssertionError("RUNNING job should not have maintenance slots")
+    j2 = submit("b", 7, 60, 1.0, iso(0))  # baseline 2 + 7 > 8 everywhere
+    r = scheduler.job_maintenance_slots(j2["id"], at(0), at(300))
+    assert r["running_baseline_gpus"] == 2
+    assert r["slots"] == [] and r["earliest_start_at"] is None
+    print("case 13 maintenance-slot queries OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

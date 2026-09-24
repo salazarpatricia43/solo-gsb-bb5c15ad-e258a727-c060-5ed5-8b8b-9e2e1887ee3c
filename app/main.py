@@ -344,6 +344,34 @@ def complete_job(job_id: str):
         raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
+@app.get("/jobs/{job_id}/maintenance-slots", tags=["jobs"])
+def job_maintenance_slots(
+    job_id: str,
+    start: datetime = Query(
+        ..., description="Range start (UTC, ISO-8601), inclusive."),
+    end: datetime = Query(
+        ..., description="Range end (UTC, ISO-8601), exclusive."),
+):
+    """Feasible estimated-start slots for a QUEUED job within ``[start, end)``.
+
+    The current RUNNING GPU usage is held as a fixed baseline across the
+    whole horizon (no future releases are speculated) and the persisted
+    maintenance windows are overlaid on the job's entire predicted run
+    ``[t, t + duration_min)``: a start instant ``t`` is feasible iff
+    baseline + job GPUs + combined reservation never exceeds cluster
+    capacity. Returns the merged feasible slots — each with inclusive
+    markers at both ends (a degenerate slot is an isolated feasible
+    instant) — plus the earliest feasible instant (``null`` when the list
+    is empty). Only QUEUED jobs are evaluated (others get 409); the result
+    is purely a resource-capacity view. Returns 400 when ``end`` is not
+    later than ``start``.
+    """
+    try:
+        return scheduler.job_maintenance_slots(job_id, start=start, end=end)
+    except SchedulerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Queue & scheduling
 # ---------------------------------------------------------------------------

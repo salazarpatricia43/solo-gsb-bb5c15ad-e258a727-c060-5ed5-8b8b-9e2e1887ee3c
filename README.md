@@ -228,6 +228,8 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
     未来区间影响）；
   - 每个 `selected_jobs` 条目附带 `estimated_start_at` / `estimated_end_at`
     （预计半开运行区间）与 `max_maintenance_reserved_gpus`（该区间峰值预留量）。
+- 对仍在排队的作业，可用 `GET /jobs/{id}/maintenance-slots` 直接查询它在指定
+  时间范围内**可行的预计开始时刻区间与最早时刻**（见下文「6b」节）。
 
 ---
 
@@ -647,6 +649,68 @@ curl -s -X POST localhost:8000/scheduler/batch \
 #                   "max_maintenance_reserved_gpus":0, ...}], ...}
 ```
 
+### 6b. 排队作业维护空档查询 `GET /jobs/{id}/maintenance-slots`
+
+对一个 **QUEUED** 作业，查询它在指定 UTC **半开区间 `[start, end)`** 内所有
+**可行的预计开始时刻**，以及最早可行时刻：
+
+- 以查询时刻**当前 RUNNING 作业占用的 GPU 数为固定基线**，在整个查询视野内
+  保持不变——**不推测**运行中作业未来何时完成释放。
+- 对候选开始时刻 `t`，把作业**整段预计运行区间 `[t, t + duration_min)`** 与
+  已保存的维护时段叠加：任一时刻
+  `RUNNING 基线 + 作业 GPU 数 + 该时刻叠加预留量 > 集群容量`，
+  该开始时刻即不可行。重叠时段预留量相加、**端点相接不算重叠**（与批次准入
+  完全同一套数据与半开语义）。
+- 结果**仅代表资源容量**：不参考租户上限/预算/余额/依赖，也不考虑其他排队作业。
+
+查询参数（UTC ISO-8601；不带时区偏移的时间戳按 UTC 解释）：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `start` | 是 | 查询起点（**UTC**），含 |
+| `end` | 是 | 查询终点（**UTC**），不含；**必须晚于 `start`，否则 400** |
+
+响应字段：
+
+- `slots`：可行开始时刻区间列表（按时间升序、重叠已合并）。每个元素含
+  `start_at` / `end_at` 与**两端包含标记** `start_inclusive` / `end_inclusive`：
+  起点侧一律包含；被阻塞区间截断的终点包含（该时刻本身可行）；最后一个区间在
+  查询终点处不含（半开）。**起止相等且两端都包含**的区间表示一个**孤立可行
+  时刻**（两侧恰被阻塞区夹住）。
+- `earliest_start_at`：最早可行开始时刻；**无空档时为 `null` 且 `slots` 为空列表**。
+- 上下文：`gpus` / `duration_min` / `cluster_gpus` /
+  `running_baseline_gpus`（固定基线）/ `query_start_at` / `query_end_at`。
+
+仅 **QUEUED** 作业可查询：RUNNING/COMPLETED/CANCELLED → 409；作业不存在 → 404。
+
+```bash
+# 集群 8 GPU：作业 2 GPU × 60 分钟；维护时段 [01:40, 03:20) 预留 7 GPU，
+# 则开始时刻落在 (00:40, 03:20) 内都会撞上预留（00:40 起运行恰在 01:40 结束，可行）
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"team-a","gpus":2,"duration_min":60}'
+curl -s -X POST localhost:8000/maintenance-windows -H 'Content-Type: application/json' \
+  -d '{"start_at":"2026-09-24T01:40:00Z","end_at":"2026-09-24T03:20:00Z","reserved_gpus":7}'
+curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
+  --data-urlencode "start=2026-09-24T00:00:00Z" \
+  --data-urlencode "end=2026-09-24T05:00:00Z"
+```
+
+```jsonc
+{
+  "job_id": "J000001", "status": "QUEUED", "gpus": 2, "duration_min": 60,
+  "cluster_gpus": 8, "running_baseline_gpus": 0,
+  "query_start_at": "2026-09-24T00:00:00+00:00",
+  "query_end_at": "2026-09-24T05:00:00+00:00",
+  "earliest_start_at": "2026-09-24T00:00:00+00:00",
+  "slots": [
+    {"start_at": "2026-09-24T00:00:00+00:00", "end_at": "2026-09-24T00:40:00+00:00",
+     "start_inclusive": true,  "end_inclusive": true},
+    {"start_at": "2026-09-24T03:20:00+00:00", "end_at": "2026-09-24T05:00:00+00:00",
+     "start_inclusive": true,  "end_inclusive": false}
+  ]
+}
+```
+
 ### 端点一览
 
 | 方法 | 路径 | 说明 |
@@ -657,6 +721,7 @@ curl -s -X POST localhost:8000/scheduler/batch \
 | PATCH | `/jobs/{id}/dependencies` | **整体替换 QUEUED 作业的前置依赖**（去重排序、空数组解除、跨租户允许；未知 id/自依赖/成环 → 400 且原依赖不变，非 QUEUED → 409）；下一次预演/批次按新依赖判断 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
+| GET | `/jobs/{id}/maintenance-slots` | **QUEUED 作业维护空档查询**：以当前 RUNNING 占用为固定基线，叠加已保存维护时段，返回 `[start, end)` 内可行的预计开始时刻区间（含两端包含标记与孤立时刻）及最早时刻；非 QUEUED → 409，无空档返回空列表 |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限，可选 `budget_gpu_min` 设置/更新/清除滚动 24h GPU-分钟预算（省略保留、null 清除） |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
 | POST | `/scheduler/batch` | **调度下一批（落库）**，返回选择顺序与余额；可选请求体 `{"now": <UTC ISO-8601>}` 指定参考时刻 |
@@ -757,8 +822,8 @@ curl -s -G localhost:8000/maintenance-windows \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（137 个：服务层算法/依赖/依赖修订/用量汇总/租户 GPU 上限/
-# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/POST /jobs 幂等提交 + HTTP 端到端）
+# 运行全部测试（153 个：服务层算法/依赖/依赖修订/用量汇总/租户 GPU 上限/
+# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -774,8 +839,8 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 app/
   config.py       # 环境变量配置
   db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/idempotent_jobs/maintenance_windows，含旧库补列迁移）
-  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段 + 租户上限/24h 预算准入 + 依赖修订 + 幂等提交，框架无关）
-  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段/空档查询 + 租户上限/24h 预算准入 + 依赖修订 + 幂等提交，框架无关）
+  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies；GET /jobs/{id}/maintenance-slots）
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
@@ -783,6 +848,7 @@ tests/
   test_budget.py       # 滚动 24h GPU-分钟预算：设置/保留/清除、超额阻塞、窗口滑动、不退费、预演不落库
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致
+  test_maintenance_slots.py  # 维护空档查询：可行开始时刻区间合并、端点相接、孤立时刻、固定 RUNNING 基线、HTTP
   test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业
   test_dependencies_revision.py  # 依赖修订：整体替换/清空、跨租户、QUEUED 限定、拒绝保持原依赖、预演与批次生效、幂等指纹保留
   test_api.py          # HTTP 端到端测试

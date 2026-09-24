@@ -192,6 +192,27 @@ while a longer candidate overlapping the window must wait. The exact same
 check runs in a real batch and in a preview (one code path), so identical
 ``now`` and state give identical selection; only the committed batch
 writes anything.
+
+Maintenance-slot queries
+========================
+``job_maintenance_slots`` (``GET /jobs/{id}/maintenance-slots``) answers,
+for a QUEUED job only, *when it could start* inside a caller-supplied
+half-open UTC range ``[start, end)``. The GPUs held by RUNNING jobs at
+query time are taken as a FIXED baseline for the whole horizon — no future
+releases are speculated — and the saved maintenance windows are overlaid
+on the job's entire predicted run ``[t, t + duration_min)``: a candidate
+start ``t`` is feasible iff at every instant of that run
+
+    RUNNING baseline + job GPUs + combined reservation <= cluster_gpus.
+
+The feasible start instants are returned as merged slots with explicit
+inclusive/exclusive markers at both ends (the query range is half-open, so
+a final slot always ends exclusive; blocked regions are open intervals, so
+a slot squeezed between two of them can degenerate to a single isolated
+instant, reported with both ends inclusive), together with the earliest
+feasible instant (``null`` when no slot exists). The result is purely a
+resource-capacity view: tenant caps, budgets, balances, dependencies and
+other queued jobs are not consulted.
 """
 from __future__ import annotations
 
@@ -1147,6 +1168,158 @@ def _peak_reserved_gpus(
         if current > peak:
             peak = current
     return peak
+
+
+def _feasible_start_slots(
+    windows: list[tuple[datetime, datetime, int]],
+    start: datetime,
+    end: datetime,
+    duration: timedelta,
+    headroom: int,
+) -> list[tuple[datetime, datetime, bool, bool]]:
+    """Feasible estimated-start instants inside the half-open ``[start, end)``.
+
+    A start instant ``t`` is feasible when, throughout the whole predicted
+    run ``[t, t + duration)``, the combined maintenance reservation never
+    exceeds ``headroom`` (cluster capacity minus the fixed RUNNING baseline
+    minus the job's own GPUs). Returns chronological ``(start, end,
+    start_inclusive, end_inclusive)`` slots; a degenerate slot
+    (``start == end``, both inclusive) is an isolated feasible instant
+    wedged between two blocked regions.
+    """
+    # Only windows that can touch some run interval [t, t + duration) for a
+    # start t inside the query range matter; clip them to that horizon.
+    horizon_end = end + duration
+    events: list[tuple[datetime, int]] = []
+    for w_start, w_end, reserved in windows:
+        lo = max(w_start, start)
+        hi = min(w_end, horizon_end)
+        if hi <= lo:
+            continue  # empty half-open intersection -> not overlapping
+        events.append((lo, reserved))
+        events.append((hi, -reserved))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    # Sweep the reservation step function and keep the maximal half-open
+    # segments [a, b) whose combined reservation exceeds the headroom.
+    # Overlapping windows sum; windows merely touching at an endpoint never
+    # stack, so adjacent over-headroom segments merge exactly.
+    blocked_sources: list[tuple[datetime, datetime]] = []
+    current = 0
+    high_since: datetime | None = None
+    i = 0
+    while i < len(events):
+        t = events[i][0]
+        while i < len(events) and events[i][0] == t:
+            current += events[i][1]
+            i += 1
+        # ``current`` is the combined reservation on [t, next event).
+        if current > headroom:
+            if high_since is None:
+                high_since = t
+        elif high_since is not None:
+            blocked_sources.append((high_since, t))
+            high_since = None
+    if high_since is not None:
+        blocked_sources.append((high_since, horizon_end))
+
+    # A start t is blocked exactly when [t, t + duration) meets a segment
+    # [a, b), i.e. when t lies in the OPEN interval (a - duration, b): a run
+    # ending exactly at a (or starting exactly at b) merely touches the
+    # reservation and stays feasible. Removing every such open interval from
+    # the half-open query range [start, end) leaves the feasible slots.
+    slots: list[tuple[datetime, datetime, bool, bool]] = []
+    cursor = start
+    for a, b in blocked_sources:
+        u = a - duration
+        v = b
+        if v <= start or u >= end:
+            continue  # blocked starts lie entirely outside the query range
+        if u >= cursor:
+            # u itself stays feasible (the blocked interval is open there);
+            # u == cursor yields a degenerate slot: an isolated instant.
+            slots.append((cursor, u, True, True))
+        if v > cursor:
+            # The blocked interval is open at v, so v itself is feasible and
+            # the next slot starts there.
+            cursor = v
+    if cursor < end:
+        slots.append((cursor, end, True, False))
+    return slots
+
+
+def job_maintenance_slots(
+    job_id: str,
+    start: datetime,
+    end: datetime,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Feasible estimated-start slots for a QUEUED job over ``[start, end)``.
+
+    The current RUNNING GPU usage is taken as a FIXED baseline held for the
+    whole horizon (no future releases are speculated): a candidate start
+    ``t`` is feasible iff at every instant of the predicted run
+    ``[t, t + duration_min)`` the baseline plus the job's GPUs plus the
+    combined maintenance reservation stays within cluster capacity. The
+    answer is purely a resource-capacity view — tenant caps, budgets,
+    balances, dependencies and other queued jobs are not consulted.
+    """
+    settings = settings or get_settings()
+    start = _as_utc(start)
+    end = _as_utc(end)
+    if end <= start:
+        raise SchedulerError("end must be later than start (UTC)")
+    with db.get_lock():
+        conn = db.get_conn()
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"job '{job_id}' not found")
+        if row["status"] != QUEUED:
+            raise Conflict(
+                f"job '{job_id}' is {row['status'].lower()}; maintenance "
+                "slots are only computed for QUEUED jobs"
+            )
+        used = int(conn.execute(
+            "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs WHERE status = ?",
+            (RUNNING,),
+        ).fetchone()["n"])
+        windows = _load_maintenance_windows(conn)
+
+        gpus = int(row["gpus"])
+        duration_min = int(row["duration_min"])
+        headroom = settings.cluster_gpus - used - gpus
+        raw_slots = (
+            _feasible_start_slots(
+                windows, start, end, timedelta(minutes=duration_min), headroom
+            )
+            if headroom >= 0 else []
+        )
+        slots = [
+            {
+                "start_at": s.isoformat(),
+                "end_at": e.isoformat(),
+                "start_inclusive": start_inclusive,
+                "end_inclusive": end_inclusive,
+            }
+            for s, e, start_inclusive, end_inclusive in raw_slots
+        ]
+        return {
+            "job_id": row["id"],
+            "status": row["status"],
+            "gpus": gpus,
+            "duration_min": duration_min,
+            "cluster_gpus": settings.cluster_gpus,
+            # Fixed baseline: GPUs held by RUNNING jobs right now, assumed to
+            # stay occupied across the whole query horizon.
+            "running_baseline_gpus": used,
+            "query_start_at": start.isoformat(),
+            "query_end_at": end.isoformat(),
+            # Earliest feasible estimated start, or null when no slot exists.
+            "earliest_start_at": slots[0]["start_at"] if slots else None,
+            "slots": slots,
+        }
 
 
 # ---------------------------------------------------------------------------
