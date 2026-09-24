@@ -306,6 +306,44 @@ def get_job(job_id: str):
         raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
+@app.get("/jobs/{job_id}/maintenance-slots", tags=["jobs"])
+def get_job_maintenance_slots(
+    job_id: str,
+    start: datetime = Query(
+        ..., description="Query window start (UTC, ISO-8601), inclusive."),
+    end: datetime = Query(
+        ..., description="Query window end (UTC, ISO-8601), exclusive; "
+                         "must be strictly later than start."),
+):
+    """Feasible estimated-start intervals for a QUEUED job over ``[start, end)``.
+
+    The current RUNNING GPU usage is a fixed baseline throughout the whole
+    horizon and the job's entire predicted half-open run
+    ``[t, t + duration_min)`` is checked against the saved maintenance
+    reservations (overlapping windows add; touching endpoints do not
+    overlap): a start ``t`` is infeasible whenever any instant of the run
+    has ``running + job gpus + reservations > cluster capacity``. Returns
+    the feasible start-time pieces, each with both endpoint-inclusive flags
+    (isolated feasible instants are degenerate ``[t, t]`` pieces), and the
+    earliest feasible instant; an empty ``slots`` list means no feasible
+    start in the window. This reflects resource capacity only — it never
+    assumes RUNNING jobs release or accounts for other QUEUED jobs, caps,
+    budgets or dependencies. Only QUEUED jobs are accepted (404 unknown,
+    409 non-QUEUED, 400 when end is not later than start).
+    """
+    def as_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    try:
+        return scheduler.maintenance_slots(
+            job_id, start=as_utc(start), end=as_utc(end)
+        )
+    except SchedulerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
 @app.patch("/jobs/{job_id}/dependencies", tags=["jobs"])
 def revise_job_dependencies(job_id: str, body: JobDependenciesIn):
     """Atomically replace a QUEUED job's prerequisite set.
